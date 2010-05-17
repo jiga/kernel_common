@@ -28,8 +28,14 @@
 #include <sound/initval.h>
 #include <sound/tlv.h>
 #include <asm/div64.h>
+#include <linux/interrupt.h>
+#include <mach/gpio.h>
+#include <linux/switch.h>
+#include <linux/debugfs.h>
 
 #include "wm8991.h"
+
+#define WM8991_INT_GPIO 0x1604
 
 /* codec private data */
 struct wm8991_priv {
@@ -37,7 +43,14 @@ struct wm8991_priv {
 	u16 reg_cache[WM8991_MAX_REGISTER + 1];
 	unsigned int sysclk;
 	unsigned int pcmclk;
+	struct switch_dev sdev;
+	struct work_struct switch_work;
 };
+
+static u32 headphone_plugged_in = 0;
+
+static struct dentry* debugfs_entry;
+struct debugfs_blob_wrapper debugfs_blob;
 
 /*
  * wm8991 register cache
@@ -53,8 +66,8 @@ static const u16 wm8991_reg[] = {
 	0x4000,     /* R5  - Audio Interface (2) */
 	0x01C8,     /* R6  - Clocking (1) */
 	0x0000,     /* R7  - Clocking (2) */
-	0x0040,     /* R8  - Audio Interface (3) */
-	0x0040,     /* R9  - Audio Interface (4) */
+	0x0020,     /* R8  - Audio Interface (3) */
+	0x0020,     /* R9  - Audio Interface (4) */
 	0x0004,     /* R10 - DAC CTRL */
 	0x00C0,     /* R11 - Left DAC Digital Volume */
 	0x00C0,     /* R12 - Right DAC Digital Volume */
@@ -64,11 +77,11 @@ static const u16 wm8991_reg[] = {
 	0x00C0,     /* R16 - Right ADC Digital Volume */
 	0x0000,     /* R17 */
 	0x0000,     /* R18 - GPIO CTRL 1 */
-	0x1000,     /* R19 - GPIO1 & GPIO2 */
-	0x1010,     /* R20 - GPIO3 & GPIO4 */
-	0x1010,     /* R21 - GPIO5 & GPIO6 */
-	0x8000,     /* R22 - GPIOCTRL 2 */
-	0x0800,     /* R23 - GPIO_POL */
+	0x1700,     /* R19 - GPIO1 & GPIO2 */
+	0x1000,     /* R20 - GPIO3 & GPIO4 */
+	0x1040,     /* R21 - GPIO5 & GPIO6 */
+	0x0000,     /* R22 - GPIOCTRL 2 */
+	0x0804,     /* R23 - GPIO_POL */
 	0x008B,     /* R24 - Left Line Input 1&2 Volume */
 	0x008B,     /* R25 - Left Line Input 3&4 Volume */
 	0x008B,     /* R26 - Right Line Input 1&2 Volume */
@@ -81,7 +94,7 @@ static const u16 wm8991_reg[] = {
 	0x0079,     /* R33 - Right OPGA Volume */
 	0x0003,     /* R34 - Speaker Volume */
 	0x0003,     /* R35 - ClassD1 */
-	0x0000,     /* R36 */
+	0x0057,     /* R36 */
 	0x0100,     /* R37 - ClassD3 */
 	0x0000,     /* R38 */
 	0x0000,     /* R39 - Input Mixer1 */
@@ -158,6 +171,34 @@ static int wm8991_write(struct snd_soc_codec *codec, unsigned int reg,
 	return 0;
 }
 
+static unsigned int wm8991_read(struct snd_soc_codec *codec, unsigned int reg)
+{
+	struct i2c_client* i2c = codec->control_data;
+	struct i2c_msg xfer[2];
+	u8 in;
+	u8 out[2];
+
+	in = reg;
+	xfer[0].addr = i2c->addr;
+	xfer[0].flags = 0;
+	xfer[0].len = 1;
+	xfer[0].buf = (u8*) &in;
+
+	xfer[1].addr = i2c->addr;
+	xfer[1].flags = I2C_M_RD;
+	xfer[1].len = 2;
+	xfer[1].buf = out;
+
+	if(i2c_transfer(i2c->adapter, xfer, 2) == 2)
+	{
+		u16 value = (out[0] << 8) | out[1];
+		wm8991_write_reg_cache(codec, reg, value);
+		return value;
+	}
+
+	return 0xFFFFFFFF;
+}
+
 #define wm8991_reset(c) wm8991_write(c, WM8991_RESET, 0)
 
 static const unsigned int rec_mix_tlv[] = {
@@ -204,7 +245,8 @@ static int wm899x_outpga_put_volsw_vu(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
-	int reg = kcontrol->private_value & 0xff;
+	struct soc_mixer_control* ctrl = (struct soc_mixer_control*) kcontrol->private_value;
+	int reg = ctrl->reg;
 	int ret;
 	u16 val;
 
@@ -214,6 +256,30 @@ static int wm899x_outpga_put_volsw_vu(struct snd_kcontrol *kcontrol,
 
 	/* now hit the volume update bits (always bit 8) */
 	val = wm8991_read_reg_cache(codec, reg);
+	return wm8991_write(codec, reg, val | 0x0100);
+}
+
+static int wm899x_outpga_put_volsw_vu_2r(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct soc_mixer_control* ctrl = (struct soc_mixer_control*) kcontrol->private_value;
+	int reg = ctrl->reg;
+	int reg_right = ctrl->rreg;
+	int ret;
+	u16 val;
+
+	ret = snd_soc_put_volsw_2r(kcontrol, ucontrol);
+	if (ret < 0)
+		return ret;
+
+	/* now hit the volume update bits (always bit 8) */
+	val = wm8991_read_reg_cache(codec, reg);
+	ret = wm8991_write(codec, reg, val | 0x0100);
+	if (ret < 0)
+		return ret;
+
+	val = wm8991_read_reg_cache(codec, reg_right);
 	return wm8991_write(codec, reg, val | 0x0100);
 }
 
@@ -227,6 +293,17 @@ static int wm899x_outpga_put_volsw_vu(struct snd_kcontrol *kcontrol,
 	.get = snd_soc_get_volsw, .put = wm899x_outpga_put_volsw_vu, \
 	.private_value = SOC_SINGLE_VALUE(reg, shift, max, invert) }
 
+#define SOC_WM899X_OUTPGA_DOUBLE_R_TLV(xname, reg_left, reg_right, xshift, xmax, xinvert,\
+					 tlv_array) \
+{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = (xname), \
+	.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ |\
+		 SNDRV_CTL_ELEM_ACCESS_READWRITE,\
+	.tlv.p = (tlv_array), \
+	.info = snd_soc_info_volsw_2r, \
+	.get = snd_soc_get_volsw_2r, .put = wm899x_outpga_put_volsw_vu_2r, \
+	.private_value = (unsigned long)&(struct soc_mixer_control) \
+		{.reg = reg_left, .rreg = reg_right, .shift = xshift, \
+		.max = xmax, .invert = xinvert} }
 
 static const char *wm8991_digital_sidetone[] =
 	{"None", "Left ADC", "Right ADC", "Reserved"};
@@ -298,6 +375,9 @@ SOC_WM899X_OUTPGA_SINGLE_R_TLV("ROUT Volume", WM8991_RIGHT_OUTPUT_VOLUME,
 	WM8991_ROUTVOL_SHIFT, WM8991_ROUTVOL_MASK, 0, out_pga_tlv),
 SOC_SINGLE("ROUT ZC", WM8991_RIGHT_OUTPUT_VOLUME, WM8991_ROZC_BIT, 1, 0),
 
+SOC_WM899X_OUTPGA_DOUBLE_R_TLV("Headphone Volume", WM8991_LEFT_OUTPUT_VOLUME, WM8991_RIGHT_OUTPUT_VOLUME,
+	WM8991_ROUTVOL_SHIFT, WM8991_ROUTVOL_MASK, 0, out_pga_tlv),
+
 /* LOPGA */
 SOC_WM899X_OUTPGA_SINGLE_R_TLV("LOPGA Volume", WM8991_LEFT_OPGA_VOLUME,
 	WM8991_LOPGAVOL_SHIFT, WM8991_LOPGAVOL_MASK, 0, out_pga_tlv),
@@ -337,7 +417,10 @@ SOC_SINGLE("Speaker Mode Switch", WM8991_CLASSD1,
 	WM8991_CDMODE_BIT, 1, 0),
 
 SOC_SINGLE("Speaker Output Attenuation Volume", WM8991_SPEAKER_VOLUME,
+	WM8991_SPKATTN_SHIFT, WM8991_SPKATTN_MASK, 0),
+SOC_SINGLE("Speaker PGA Volume", WM8991_CLASSD4,
 	WM8991_SPKVOL_SHIFT, WM8991_SPKVOL_MASK, 0),
+SOC_SINGLE("Speaker ZC", WM8991_CLASSD4, WM8991_SPKZC_BIT, 1, 0), 
 SOC_SINGLE("Speaker DC Boost Volume", WM8991_CLASSD3,
 	WM8991_DCGAIN_SHIFT, WM8991_DCGAIN_MASK, 0),
 SOC_SINGLE("Speaker AC Boost Volume", WM8991_CLASSD3,
@@ -438,6 +521,12 @@ SOC_SINGLE("RIN34 ZC Switch", WM8991_RIGHT_LINE_INPUT_3_4_VOLUME,
 SOC_SINGLE("RIN34 Mute Switch", WM8991_RIGHT_LINE_INPUT_3_4_VOLUME,
 	WM8991_RI34MUTE_BIT, 1, 0),
 
+SOC_SINGLE("Mic Short Circuit Current Detect Threshold", WM8991_MICBIAS,
+	WM8991_MCDSCTH, 3, 0),
+
+SOC_SINGLE("Mic Enable Switch", WM8991_POWER_MANAGEMENT_1,
+	WM8991_MIC_ENA_BIT, 1, 0),
+
 };
 
 /*
@@ -472,7 +561,8 @@ static int inmixer_event(struct snd_soc_dapm_widget *w,
 static int outmixer_event(struct snd_soc_dapm_widget *w,
 	struct snd_kcontrol *kcontrol, int event)
 {
-	u32 reg_shift = kcontrol->private_value & 0xfff;
+	struct soc_mixer_control* ctrl = (struct soc_mixer_control*) kcontrol->private_value;
+	u32 reg_shift = ctrl->reg | (ctrl->shift << 8);
 	int ret = 0;
 	u16 reg;
 
@@ -514,7 +604,8 @@ static int outmixer_event(struct snd_soc_dapm_widget *w,
 		break;
 
 	default:
-		BUG();
+		printk("wm8991: unknown event 0x%x\n", reg_shift);
+//		BUG();
 	}
 
 	return ret;
@@ -1045,7 +1136,7 @@ static void pll_factors(struct _pll_div *pll_div, unsigned int target,
 }
 
 static int wm8991_set_dai_pll(struct snd_soc_dai *codec_dai,
-	int pll_id, int src, unsigned int freq_in, unsigned int freq_out)
+	int pll_id, unsigned int freq_in, unsigned int freq_out)
 {
 	u16 reg;
 	struct snd_soc_codec *codec = codec_dai->codec;
@@ -1377,6 +1468,54 @@ struct snd_soc_codec_device soc_codec_dev_wm8991 = {
 };
 EXPORT_SYMBOL_GPL(soc_codec_dev_wm8991);
 
+static ssize_t wm8991_switch_print_state(struct switch_dev *sdev, char *buf)
+{
+	if(headphone_plugged_in)
+		return sprintf(buf, "1\n");
+	else
+		return sprintf(buf, "0\n");
+}
+
+static void wm8991_switch_work(struct work_struct *work)
+{
+	struct wm8991_priv* wm8991 = container_of(work, struct wm8991_priv, switch_work);
+	struct snd_soc_codec *codec = &wm8991->codec;
+	uint16_t status;
+	uint16_t polarity;
+
+	if(!gpio_get_value(WM8991_INT_GPIO))
+		return;
+
+	status = wm8991_read(codec, WM8991_GPIO_CTRL_1);
+	polarity = wm8991_read(codec, WM8991_GPIO_POL);
+
+	if(status & (1 << 4))
+	{
+		if(polarity & (1 << 4))
+		{
+			polarity = polarity & ~(1 << 4);
+			headphone_plugged_in = 0;
+		} else
+		{
+			polarity = polarity | (1 << 4);
+			headphone_plugged_in = 1;
+		}
+
+		switch_set_state(&wm8991->sdev, headphone_plugged_in);
+
+		wm8991_write(codec, WM8991_GPIO_POL, polarity);
+	}
+
+	wm8991_write(codec, WM8991_GPIO_CTRL_1, status);
+}
+
+static irqreturn_t wm8991_irq(int irq, void* pToken)
+{
+	struct wm8991_priv* wm8991 = (struct wm8991_priv*) pToken;
+	schedule_work(&wm8991->switch_work);
+	return IRQ_HANDLED;
+}
+
 static int wm8991_register(struct wm8991_priv *wm8991)
 {
 	int ret;
@@ -1424,15 +1563,19 @@ static int wm8991_register(struct wm8991_priv *wm8991)
 	wm8991_write(codec, WM8991_GPIO1_GPIO2, reg | 1);
 
 	reg = wm8991_read_reg_cache(codec, WM8991_POWER_MANAGEMENT_1);
-	wm8991_write(codec, WM8991_POWER_MANAGEMENT_1, reg | WM8991_VREF_ENA|
-		WM8991_VMID_MODE_MASK);
+	wm8991_write(codec, WM8991_POWER_MANAGEMENT_1, reg | WM8991_VREF_ENA |
+	    ((1 << 1) & WM8991_VMID_MODE_MASK));
 
-	reg = wm8991_read_reg_cache(codec, WM8991_POWER_MANAGEMENT_2);
-	wm8991_write(codec, WM8991_POWER_MANAGEMENT_2, reg | WM8991_OPCLK_ENA);
+	wm8991_write(codec, WM8991_ANTIPOP2, WM8991_BUFIOEN);
 
 	wm8991_write(codec, WM8991_DAC_CTRL, 0);
 	wm8991_write(codec, WM8991_LEFT_OUTPUT_VOLUME, 0x50 | (1<<8));
 	wm8991_write(codec, WM8991_RIGHT_OUTPUT_VOLUME, 0x50 | (1<<8));
+
+	wm8991_write(codec, WM8991_GPIO1_GPIO2, WM8991_GPIO2_PD | 0x700);	// GPIO2 pulldown, GPIO2 is IRQ
+	wm8991_write(codec, WM8991_GPIO3_GPIO4, WM8991_GPIO4_PD);
+	wm8991_write(codec, WM8991_GPIO5_GPIO6, WM8991_GPIO6_PD | WM8991_GPIO5_IRQ_ENA);
+	wm8991_write(codec, WM8991_GPIO_POL, WM8991_TEMPOK_POL | WM8991_GPIO3_POL);
 
 	wm8991_codec = codec;
 
@@ -1449,11 +1592,36 @@ static int wm8991_register(struct wm8991_priv *wm8991)
 		return ret;
 	}
 
+	INIT_WORK(&wm8991->switch_work, wm8991_switch_work);
+
+	iphone_gpio_pin_reset(WM8991_INT_GPIO);
+	request_irq(gpio_to_irq(WM8991_INT_GPIO), wm8991_irq, IRQF_TRIGGER_RISING, "wm8991", wm8991);
+
+	wm8991->sdev.name = "h2w";
+	wm8991->sdev.print_state = wm8991_switch_print_state;
+
+	ret = switch_dev_register(&wm8991->sdev);
+	if (ret < 0)
+	{
+		dev_err(codec->dev, "Failed to register headphone detection switch: %d\n", ret);
+		snd_soc_unregister_dai(&wm8991_dai);
+		snd_soc_unregister_codec(codec);
+	}
+
+	debugfs_entry = debugfs_create_dir("wm8991", NULL);
+	debugfs_blob.data = &wm8991->reg_cache;
+	debugfs_blob.size = (WM8991_MAX_REGISTER + 1) * sizeof(u16);
+	debugfs_create_blob("registers", S_IRUSR, debugfs_entry, &debugfs_blob);
+	debugfs_create_bool("headphone", S_IRUSR, debugfs_entry, &headphone_plugged_in);
+
 	return 0;
 }
 
 static void wm8991_unregister(struct wm8991_priv *wm8991)
 {
+	debugfs_remove_recursive(debugfs_entry);
+	switch_dev_unregister(&wm8991->sdev);
+	free_irq(gpio_to_irq(WM8991_INT_GPIO), wm8991->codec.dev);
 	wm8991_set_bias_level(&wm8991->codec, SND_SOC_BIAS_OFF);
 	snd_soc_unregister_dai(&wm8991_dai);
 	snd_soc_unregister_codec(&wm8991->codec);
